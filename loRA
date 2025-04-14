@@ -1,0 +1,110 @@
+pip3 install transformers==4.44.1
+pip3 install accelerate
+pip3 install bitsandbytes==0.43.3
+pip3 install datasets==2.21.0
+pip3 install trl==0.9.6
+pip3 install peft==0.12.0
+!pip install -U "huggingface_hub[cli]"
+
+!huggingface-cli login --token "Enter your token" --add-to-git-credential
+
+#Quantization
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
+
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+)
+
+model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+quantized_model = AutoModelForCausalLM.from_pretrained(model_name,
+                    quantization_config = bnb_config,
+                    device_map = "auto")
+                    
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+input = tokenizer("Natalia sold clips to 48 of her friends in April, and then she sold half as \
+many clips in May. How many clips did Natalia sell altogether in April and May?", return_tensors="pt").to('cuda')
+
+response = quantized_model.generate(**input, max_new_tokens = 100)
+print(tokenizer.batch_decode(response, skip_special_tokens=True))
+
+from datasets import load_dataset
+
+dataset = "openai/gsm8k"
+data = load_dataset(dataset, 'main')
+
+tokenizer.pad_token = tokenizer.eos_token
+data = data.map(lambda samples: tokenizer(samples["question"], samples["answer"], truncation=True, padding="max_length", max_length=100), batched=True)
+train_sample = data["train"].select(range(400))
+
+display(train_sample)
+Dataset({
+    features: ['question', 'answer', 'input_ids', 'attention_mask'],
+    num_rows: 400
+})
+
+import peft
+from peft import LoraConfig
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=16,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+from transformers import TrainingArguments
+import os
+
+working_dir = './'
+output_directory = os.path.join(working_dir, "lora")
+
+training_args = TrainingArguments(
+    output_dir = output_directory,
+    auto_find_batch_size = True,
+    learning_rate = 3e-4,
+    num_train_epochs=5
+)
+
+import transformers
+from trl import SFTTrainer
+
+trainer = SFTTrainer(
+    model = quantized_model,
+    args = training_args,
+    train_dataset = train_sample,
+    peft_config = lora_config,
+    tokenizer = tokenizer,
+    data_collator = transformers.DataCollatorForLanguageModeling(tokenizer, mlm=False)
+)
+
+trainer.train()
+
+# Save the model.
+model_path = os.path.join(output_directory, f"lora_model")
+trainer.model.save_pretrained(model_path)
+
+model_path = "/trained_models/lora/lora_model"
+
+from peft import AutoPeftModelForCausalLM
+from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+)
+
+loaded_model = AutoPeftModelForCausalLM.from_pretrained(
+                                        model_path,
+                                        quantization_config = bnb_config,
+                                        device_map = 'auto')
+                                        
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+input = tokenizer("Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?", return_tensors="pt").to('cuda')
+
+response = loaded_model.generate(**input, max_new_tokens = 100)
+print(tokenizer.batch_decode(response, skip_special_tokens=True))
+
+
